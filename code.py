@@ -5,13 +5,14 @@ from gamepad_state import GamepadState
 import board
 from adafruit_motor import servo
 import pwmio
+from time import sleep
 
 CS_PIN = board.GP0
 RESET_PIN = board.GP1
 CLOCK_PIN = board.GP2
 MOSI_PIN = board.GP3
 MISO_PIN = board.GP4
-MIN_THROTTLE = 58
+MIN_THROTTLE = 56
 MAX_THROTTLE = 180
 RADIO_FREQ_MHZ = 915.0
 
@@ -31,6 +32,25 @@ servo4 = servo.Servo(pwm4)
 
 armed = False
 
+if False:
+    # center servos
+    servo1.angle = 90
+    servo2.angle = 90
+    servo4.angle = 90
+    sleep(10000)
+if False:
+    # wiggle servos through max range to test
+    while True:
+        for angle in range(50, 131, 10):
+            servo1.angle = angle
+            servo2.angle = angle
+            servo4.angle = angle
+            sleep(0.1)
+        for angle in range(130, 49, -10):
+            servo1.angle = angle
+            servo2.angle = angle
+            servo4.angle = angle
+            sleep(0.1)
 
 radio_cs = digitalio.DigitalInOut(CS_PIN)
 radio_reset = digitalio.DigitalInOut(RESET_PIN)
@@ -38,6 +58,8 @@ radio_spi = busio.SPI(clock=CLOCK_PIN, MOSI=MOSI_PIN, MISO=MISO_PIN)
 
 
 rfm69 = adafruit_rfm69.RFM69(radio_spi, radio_cs, radio_reset, RADIO_FREQ_MHZ)
+
+rssi_history = [0] * 30
 
 # Wait to receive packets.
 print("Waiting for packets...")
@@ -70,12 +92,17 @@ while True:
                     + MIN_THROTTLE
                 )
                 if armed
-                else 20
+                else 18
             )
             throttle_servo.angle = throttle_angle
-            print(
-                f"Right Y: {round(state.RY, 2):<5}, Angle: {angle1:<3}, Right X: {round(state.RX, 2):<5}, Angle: {angle2:<3}, Left Y: {round(state.LY, 2):<5}, Throttle Angle: {throttle_angle:<3}, Left X: {round(state.LX, 2):<5}, Angle: {angle4:<3}",
-                end="\r",
-            )
+            rssi_history.append(rfm69.last_rssi)
+            if len(rssi_history) > 30:
+                rssi_history.pop(0)
+            avg_rssi = sum(rssi_history) / len(rssi_history)
+            print(f"rfm69.last_rssi: {rfm69.last_rssi}, Avg RSSI: {avg_rssi:.1f}", end="\r")
+            # print(
+            #     f"Right Y: {round(state.RY, 2):<5}, Angle: {angle1:<3}, Right X: {round(state.RX, 2):<5}, Angle: {angle2:<3}, Left Y: {round(state.LY, 2):<5}, Throttle Angle: {throttle_angle:<3}, Left X: {round(state.LX, 2):<5}, Angle: {angle4:<3}",
+            #     end="\r",
+            # )
         else:
             print("Invalid state data: " + gamepadstate_in_bytes.decode())
