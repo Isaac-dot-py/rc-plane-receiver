@@ -1,7 +1,8 @@
+# BEFORE YOU GET CONFUSED, THE BUTTONS ARE NAMED AFTER A ONE BASED INDEXING SYSTEM, BUT THE RECEIVED LIST OF BUTTON PRESSES IS ZERO BASED
+
 import digitalio
 import adafruit_rfm69
 import busio
-from gamepad_state import GamepadState
 import board
 from adafruit_motor import servo
 import pwmio
@@ -15,20 +16,22 @@ MISO_PIN = board.GP4
 RADIO_FREQ_MHZ = 915.0
 MIN_THROTTLE = 0
 MAX_THROTTLE = 180
-ELEVATOR_CENTER = 90
-ELEVAROR_GAIN = 20
-RUDDER_CENTER = 90
-RUDDER_GAIN = 20
+ELEVATOR_CENTER = 96
+ELEVAROR_GAIN = -20
+RUDDER_CENTER = 102
+RUDDER_GAIN = -20
 LEFT_FLAPERON_CENTER = 90
 RIGHT_FLAPERON_CENTER = 90
-AILERON_GAIN = 20 / 90
+AILERON_GAIN = 1
 
 
 led = digitalio.DigitalInOut(board.LED)
 led.direction = digitalio.Direction.OUTPUT
 
 elevator = servo.Servo(pwmio.PWMOut(board.GP21, duty_cycle=2**15, frequency=50))
+elevator.angle = ELEVATOR_CENTER
 rudder = servo.Servo(pwmio.PWMOut(board.GP20, duty_cycle=2**15, frequency=50))
+rudder.angle = RUDDER_CENTER
 left_flaperon = servo.Servo(pwmio.PWMOut(board.GP19, duty_cycle=2**15, frequency=50))
 right_flaperon = servo.Servo(pwmio.PWMOut(board.GP18, duty_cycle=2**15, frequency=50))
 flap_angle = 0
@@ -36,7 +39,7 @@ throttle_servo = servo.Servo(pwmio.PWMOut(board.GP22, duty_cycle=2**15, frequenc
 throttle_servo.angle = 0
 
 armed = False
-
+taxiing = False # reduces throttle to 10% of what it would be
 
 def calculate_flaperons(
     difference_aileron, loose_average_flap, minimum_output=-1, maximum_output=1
@@ -58,13 +61,39 @@ def calculate_flaperons(
     )
 
 
-if True:
+
+
+HAT_TO_DEGREES = (0, 45, 90, 135, 180, 225, 270, 315, -1)  # 8=centered -> -1
+def parse_report(data):
+    if len(data) < 7:
+        print("Invalid data length: " + str(len(data)))
+        return None
+
+    x = data[0] | ((data[1] & 0x03) << 8)  # 0..1023
+    y = (data[1] >> 2) | ((data[2] & 0x0F) << 6)  # 0..1023
+    hat_nibble = data[2] >> 4  # 0..8 (8 = centered)
+    twist = data[3]  # 0..255
+    buttons_a = data[4]
+    slider = data[5]  # 0..255
+    buttons_b = data[6]
+
+    axes = [x, y, twist, slider]  # index 0=X, 1=Y, 2=twist(Z), 3=slider/throttle
+
+    buttons_mask = buttons_a | (buttons_b << 8)
+    buttons = [bool(buttons_mask & (1 << i)) for i in range(12)]  # 12 buttons
+
+    pov = HAT_TO_DEGREES[hat_nibble] if hat_nibble < len(HAT_TO_DEGREES) else -1
+
+    return axes, buttons, pov
+
+
+if False:
     # center servos
     elevator.angle = 90
     rudder.angle = 90
     left_flaperon.angle = 90
     right_flaperon.angle = 90
-    sleep(10000)
+    sleep(1000000)
 if False:
     # wiggle servos to test
     while True:
@@ -93,46 +122,59 @@ rssi_history = [0] * 30
 print("Waiting for packets...")
 while True:
     # Look for a new packet - wait up to 5 seconds:
-    gamepadstate_in_bytes = rfm69.receive(timeout=5.0)
+    received_bytes = rfm69.receive(timeout=5.0)
     # If no packet was received during the timeout then None is returned.
-    if gamepadstate_in_bytes is not None:
-        # Create a GamepadState from the bytes
-        state = GamepadState.from_bytes(gamepadstate_in_bytes)
-        if state:
-            # C2 is arming button, arm when C2 is pressed and throttle is at minimum
-            if state.C2 and not armed and state.LY < -0.95:
-                armed = True
-            # Disarm when C1 is pressed
-            if state.C1 and armed:
-                armed = False
+    if received_bytes is not None:
+        parsed = parse_report(received_bytes)
+        if parsed is None:
+            print("Invalid state data: " + received_bytes.decode())
+            continue
+        axes, buttons, pov = parsed
+            # buttons 7 and 8 are arming buttons, arm when both are pressed and throttle is at minimum
+        if buttons[6] and buttons[7] and axes[3] > 0.95 * 255:
+            armed = True
+        # Disarm when button 11 is pressed
+        if buttons[10]:
+            armed = False
 
-            # Map input (-1 to 1) to angle (0 to 180)
-            elevator.angle = state.RY * ELEVAROR_GAIN + ELEVATOR_CENTER
-            rudder.angle = state.RX * RUDDER_GAIN + RUDDER_CENTER
+        if buttons[9]:
+            taxiing = False
+        if buttons[11]:
+            taxiing = True
 
-            aileron_calculation_result = calculate_flaperons(
-                state.RX * AILERON_GAIN, flap_angle / 90, 180
-            )
-            left_flaperon.angle = aileron_calculation_result[0]
-            right_flaperon.angle = aileron_calculation_result[1]
+        if buttons[2] and flap_angle < 40:
+            flap_angle += 1
+        if buttons[4] and flap_angle > 0:
+            flap_angle -= 1
 
-            throttle_angle = (
-                int(((state.LY + 1) / 2) * (MAX_THROTTLE - MIN_THROTTLE) + MIN_THROTTLE)
-                if armed
-                else 0
-            )
-            throttle_servo.angle = throttle_angle
-            rssi_history.append(rfm69.last_rssi)
-            if len(rssi_history) > 30:
-                rssi_history.pop(0)
-            avg_rssi = sum(rssi_history) / len(rssi_history)
-            print(
-                f"rfm69.last_rssi: {rfm69.last_rssi}, Avg RSSI: {avg_rssi:.1f}",
-                end="\r",
-            )
-            # print(
-            #     f"Right Y: {round(state.RY, 2):<5}, Angle: {angle1:<3}, Right X: {round(state.RX, 2):<5}, Angle: {angle2:<3}, Left Y: {round(state.LY, 2):<5}, Throttle Angle: {throttle_angle:<3}, Left X: {round(state.LX, 2):<5}, Angle: {angle4:<3}",
-            #     end="\r",
-            # )
-        else:
-            print("Invalid state data: " + gamepadstate_in_bytes.decode())
+        # Map input (0 to 1023) to angle (0 to 180)
+        elevator.angle = -(axes[1] / 1023.0 * 2 - 1) * ELEVAROR_GAIN + ELEVATOR_CENTER
+        # print(f"elevator angle {elevator.angle}")
+        rudder.angle = (axes[2] / 255.0 * 2 - 1) * RUDDER_GAIN + RUDDER_CENTER
+        # print(f"axes[2]: {axes[2]}, minus 1 to 1 number: {(axes[2] / 255.0 * 2 - 1)}, rudder angle {rudder.angle}")
+
+        aileron_calculation_result = calculate_flaperons(
+            (axes[0] / 1023.0 * 2 - 1), flap_angle / 90
+        )
+        # print((axes[0] / 1023.0 * 2 - 1))
+        left_flaperon.angle = -aileron_calculation_result[0]*90+90
+        right_flaperon.angle = aileron_calculation_result[1]*90+90
+
+        throttle_angle = (
+            int(((255.0 - axes[3]) / 255.0) * (0.1 if taxiing else 1.0) * (MAX_THROTTLE - MIN_THROTTLE) + MIN_THROTTLE)
+            if armed
+            else 0
+        )
+        print(f"throttle_angle: {throttle_angle}, armed: {armed}, taxiing: {taxiing}")
+        throttle_servo.angle = throttle_angle
+        rssi_history.append(rfm69.last_rssi)
+        if len(rssi_history) > 30:
+            rssi_history.pop(0)
+        avg_rssi = sum(rssi_history) / len(rssi_history)
+        # print(
+        #     f"rfm69.last_rssi: {rfm69.last_rssi}, Avg RSSI: {avg_rssi:.1f}",
+        #     end="\r",
+        # )
+        # print(" ".join(f"{b:02x}" for b in received_bytes), "axes:", axes, "buttons:", buttons, "pov:", pov)
+    else:
+        print("Received nothing!")
