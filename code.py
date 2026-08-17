@@ -6,7 +6,7 @@ import busio
 import board
 from adafruit_motor import servo
 import pwmio
-from time import sleep
+from time import sleep, monotonic
 
 CS_PIN = board.GP0
 RESET_PIN = board.GP1
@@ -17,12 +17,14 @@ RADIO_FREQ_MHZ = 915.0
 MIN_THROTTLE = 0
 MAX_THROTTLE = 180
 ELEVATOR_CENTER = 96
-ELEVAROR_GAIN = -20
+ELEVAROR_THROW = -20
 RUDDER_CENTER = 102
-RUDDER_GAIN = -20
+RUDDER_THROW = -20
 LEFT_FLAPERON_CENTER = 90
 RIGHT_FLAPERON_CENTER = 90
-AILERON_GAIN = 1
+FLAPERON_MINIMUM_TOTAL_THROW = 60 # TODO
+FLAPERON_MAXIMUM_TOTAL_THROW = 120 # TODO
+AILERON_THROW = 40 # difference between left and right flaperon angles, not the angle of each flaperon
 
 
 led = digitalio.DigitalInOut(board.LED)
@@ -42,22 +44,22 @@ armed = False
 taxiing = False # reduces throttle to 10% of what it would be
 
 def calculate_flaperons(
-    difference_aileron, loose_average_flap, minimum_output=-1, maximum_output=1
+    difference_aileron_degrees, loose_average_flap, minimum_output, maximum_output
 ):
-    # all numbers -1 to 1
-    if abs(difference_aileron) > maximum_output - minimum_output:
+    # all numbers in degrees, outputs degrees
+    if abs(difference_aileron_degrees) > maximum_output - minimum_output:
         return (
             (maximum_output, minimum_output)
-            if difference_aileron > 0
+            if difference_aileron_degrees > 0
             else (minimum_output, maximum_output)
         )
     average_modified_to_respect_bounds = max(
-        minimum_output + abs(difference_aileron) / 2,
-        min(maximum_output - abs(difference_aileron) / 2, loose_average_flap),
+        minimum_output + abs(difference_aileron_degrees) / 2,
+        min(maximum_output - abs(difference_aileron_degrees) / 2, loose_average_flap),
     )
     return (
-        average_modified_to_respect_bounds + difference_aileron / 2,
-        average_modified_to_respect_bounds - difference_aileron / 2,
+        average_modified_to_respect_bounds + difference_aileron_degrees / 2,
+        average_modified_to_respect_bounds - difference_aileron_degrees / 2,
     )
 
 
@@ -118,6 +120,8 @@ rfm69 = adafruit_rfm69.RFM69(radio_spi, radio_cs, radio_reset, RADIO_FREQ_MHZ)
 
 rssi_history = [0] * 30
 
+last_received_time = monotonic()
+
 # Wait to receive packets.
 print("Waiting for packets...")
 while True:
@@ -148,24 +152,20 @@ while True:
             flap_angle -= 1
 
         # Map input (0 to 1023) to angle (0 to 180)
-        elevator.angle = -(axes[1] / 1023.0 * 2 - 1) * ELEVAROR_GAIN + ELEVATOR_CENTER
-        # print(f"elevator angle {elevator.angle}")
-        rudder.angle = (axes[2] / 255.0 * 2 - 1) * RUDDER_GAIN + RUDDER_CENTER
-        # print(f"axes[2]: {axes[2]}, minus 1 to 1 number: {(axes[2] / 255.0 * 2 - 1)}, rudder angle {rudder.angle}")
+        elevator.angle = -(axes[1] / 1023.0 * 2 - 1) * ELEVAROR_THROW + ELEVATOR_CENTER
+        rudder.angle = (axes[2] / 255.0 * 2 - 1) * RUDDER_THROW + RUDDER_CENTER
 
         aileron_calculation_result = calculate_flaperons(
-            (axes[0] / 1023.0 * 2 - 1), flap_angle / 90
+            (axes[0] / 1023.0 * 2 - 1) * AILERON_THROW, flap_angle, FLAPERON_MINIMUM_TOTAL_THROW, FLAPERON_MAXIMUM_TOTAL_THROW
         )
-        # print((axes[0] / 1023.0 * 2 - 1))
-        left_flaperon.angle = -aileron_calculation_result[0]*90+90
-        right_flaperon.angle = aileron_calculation_result[1]*90+90
+        left_flaperon.angle = -aileron_calculation_result[0] + LEFT_FLAPERON_CENTER
+        right_flaperon.angle = aileron_calculation_result[1] + RIGHT_FLAPERON_CENTER
 
         throttle_angle = (
             int(((255.0 - axes[3]) / 255.0) * (0.1 if taxiing else 1.0) * (MAX_THROTTLE - MIN_THROTTLE) + MIN_THROTTLE)
             if armed
             else 0
         )
-        print(f"throttle_angle: {throttle_angle}, armed: {armed}, taxiing: {taxiing}")
         throttle_servo.angle = throttle_angle
         rssi_history.append(rfm69.last_rssi)
         if len(rssi_history) > 30:
@@ -176,5 +176,13 @@ while True:
         #     end="\r",
         # )
         # print(" ".join(f"{b:02x}" for b in received_bytes), "axes:", axes, "buttons:", buttons, "pov:", pov)
+        last_received_time = monotonic()
     else:
         print("Received nothing!")
+        if monotonic() - last_received_time > 1:
+            print("No data received for 1 second. Reverting to safe state.")
+            elevator.angle = ELEVATOR_CENTER + 20
+            rudder.angle = RUDDER_CENTER + 20
+            throttle_servo.angle = 0
+            left_flaperon.angle = LEFT_FLAPERON_CENTER
+            right_flaperon.angle = RIGHT_FLAPERON_CENTER
